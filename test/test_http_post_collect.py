@@ -163,6 +163,29 @@ def test_http_post_wrong_header_exception(sess):
     assert did_raise
 
 
+def test_http_post_kafka_rest_proxy_content_type(sess):
+    """Confirm that Kafka REST Proxy media types (application/vnd.kafka.*+json)
+    are accepted -- the queue worker is content-type-agnostic and the wrapper
+    must let this through for callers POSTing to a Kafka REST Proxy."""
+
+    for content_type in (
+        "application/vnd.kafka.json.v2+json",
+        "application/vnd.kafka.binary.v2+json",
+        "application/vnd.kafka.v2+json",
+    ):
+        (request_id,) = sess.execute(text(
+            """
+            select net.http_post(
+                url:='http://localhost:8080/post',
+                body:='{"records":[{"value":{"hello":"world"}}]}'::jsonb,
+                headers:=jsonb_build_object('Content-Type', :ct)
+            );
+            """
+        ), {"ct": content_type}).fetchone()
+
+        assert request_id is not None
+
+
 def test_http_post_no_content_type_coerce(sess):
     """Confirm that a missing content type coerces to application/json"""
 

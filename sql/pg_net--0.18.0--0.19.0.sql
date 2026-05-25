@@ -80,9 +80,14 @@ begin
         select headers || '{"Content-Type": "application/json"}'::jsonb into headers;
     end if;
 
-    -- Confirm that the content-type is set as "application/json"
-    if content_type <> 'application/json' then
-        raise exception 'Content-Type header must be "application/json"';
+    -- Confirm that the content-type is "application/json" or a Kafka REST
+    -- Proxy JSON media type (application/vnd.kafka.<embedded>+json, e.g.
+    -- application/vnd.kafka.json.v2+json). The body parameter is jsonb so
+    -- the wire payload is always JSON-shaped; this guard exists only to
+    -- catch obvious mismatches between the declared header and the body.
+    if content_type <> 'application/json'
+       and content_type not like 'application/vnd.kafka.%+json' then
+        raise exception 'Content-Type header must be "application/json" or "application/vnd.kafka.<variant>+json"';
     end if;
 
     select
