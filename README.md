@@ -20,6 +20,7 @@ Requires libcurl >= 7.83. Compatible with PostgreSQL > = 12.
     - GET requests
     - POST requests
     - DELETE requests
+    - [Retries](#retries)
 - [Practical Examples](#practical-examples)
     - Syncing data with an external data source using triggers
     - Calling a serverless function every minute with PG_CRON
@@ -64,9 +65,14 @@ The extension introduces a new `net` schema, which contains two unlogged tables,
             url text NOT NULL,
             headers jsonb,
             body bytea,
-            timeout_milliseconds integer NOT NULL
+            timeout_milliseconds integer NOT NULL,
+            max_retries integer NOT NULL DEFAULT 0,
+            attempts integer NOT NULL DEFAULT 0,
+            next_attempt_at timestamptz NOT NULL DEFAULT now()
         )
     ```
+
+    A request that failed and still has retries left goes back to this table with its `attempts` increased and `next_attempt_at` set to the time of its next attempt. See [Retries](#retries).
 
 2. **`_http_response`**: This table holds the responses of each executed request.
 
@@ -82,9 +88,12 @@ The extension introduces a new `net` schema, which contains two unlogged tables,
             content text NULL,
             timed_out boolean NULL,
             error_msg text NULL,
-            created timestamp with time zone NOT NULL DEFAULT now()
+            created timestamp with time zone NOT NULL DEFAULT now(),
+            attempts integer NOT NULL DEFAULT 1
         )
     ```
+
+    A request gets a single row here, no matter how many times it was retried. `attempts` tells how many attempts it took.
 
 When any of the three request functions (`http_get`, `http_post`, `http_delete`) are invoked, they create an entry in the `net.http_request_queue` table.
 
@@ -127,6 +136,14 @@ To activate the extension in PostgreSQL, run the create extension command. The e
 create extension pg_net;
 ```
 
+When upgrading pg_net, the new library is loaded on postgres restart while the `net` schema is only updated by:
+
+```psql
+alter extension pg_net update;
+```
+
+Until that runs, the worker logs a warning and leaves the requests on the queue, it starts processing them as soon as the extension is updated.
+
 ---
 
 # Extension Configuration
@@ -137,6 +154,8 @@ The extension creates the following configurable variables:
 2. **pg_net.ttl** _(default: 6 hours)_: An interval that defines the max time a row in the _`net.http_response`_ will live before being deleted. Note that this won't happen exactly after the TTL has passed. The worker will perform this deletion while its processing requests.
 3. **pg_net.database_name** _(default: 'postgres')_: A string that defines which database the extension is applied to
 4. **pg_net.username** _(default: NULL)_: A string that defines which user will the background worker be connected with. If not set (`NULL`), it will assume the bootstrap user.
+5. **pg_net.retry_base_delay_milliseconds** _(default: 1000)_: An integer with the delay before the first retry of a failed request. The delay doubles on every attempt.
+6. **pg_net.retry_max_delay_milliseconds** _(default: 60000)_: An integer that caps the delay between retries. It also caps the delay asked for by a `Retry-After` response header.
 
 All these variables can be viewed with the following commands:
 ```sql
@@ -144,6 +163,8 @@ show pg_net.batch_size;
 show pg_net.ttl;
 show pg_net.database_name;
 show pg_net.username;
+show pg_net.retry_base_delay_milliseconds;
+show pg_net.retry_max_delay_milliseconds;
 ```
 
 You can change these by editing the `postgresql.conf` file (find it with `SHOW config_file;`) or with `ALTER SYSTEM`:
@@ -190,7 +211,11 @@ net.http_get(
     -- key/values to be included in request headers
     headers jsonb default '{}'::jsonb,
     -- the maximum number of milliseconds the request may take before being cancelled
-    timeout_milliseconds int default 1000
+    timeout_milliseconds int default 1000,
+    -- how many times a failed request will be retried, zero disables retries
+    max_retries int default 0,
+    -- value for the `Idempotency-Key` header, so a retry is not taken as a new request
+    idempotency_key text default null
 )
     -- request_id reference
     returns bigint
@@ -253,7 +278,11 @@ net.http_post(
     -- key/values to be included in request headers
     headers jsonb default '{"Content-Type": "application/json"}'::jsonb,
     -- the maximum number of milliseconds the request may take before being cancelled
-    timeout_milliseconds int default 1000
+    timeout_milliseconds int default 1000,
+    -- how many times a failed request will be retried, zero disables retries
+    max_retries int default 0,
+    -- value for the `Idempotency-Key` header, so a retry is not taken as a new request
+    idempotency_key text default null
 )
     -- request_id reference
     returns bigint
@@ -328,7 +357,13 @@ net.http_delete(
     -- key/values to be included in request headers
     headers jsonb default '{}'::jsonb,
     -- the maximum number of milliseconds the request may take before being cancelled
-    timeout_milliseconds int default 2000
+    timeout_milliseconds int default 2000,
+    -- optional body of the request
+    body jsonb default NULL,
+    -- how many times a failed request will be retried, zero disables retries
+    max_retries int default 0,
+    -- value for the `Idempotency-Key` header, so a retry is not taken as a new request
+    idempotency_key text default null
 )
     -- request_id reference
     returns bigint
@@ -383,6 +418,60 @@ SELECT
     ) AS request_id
 FROM selected_row
 ```
+
+## Retries
+
+By default a request is attempted once and whatever comes back, a response or an error, is stored on `net._http_response`. Pass `max_retries` to have the worker attempt a failed request again:
+
+```sql
+select net.http_post(
+    url := 'https://api.example.com/webhook',
+    body := '{"hello": "world"}'::jsonb,
+    max_retries := 3
+) as request_id;
+```
+
+The request above is attempted up to 4 times, the first attempt plus 3 retries. Retries stop at the first attempt that doesn't fail, and only then is a row inserted on `net._http_response`, so a retried request still gets a single response row. Its `attempts` column tells how many attempts were made:
+
+```sql
+select id, status_code, error_msg, attempts from net._http_response;
+```
+
+While a request is waiting for its next attempt it sits on `net.http_request_queue`, where `next_attempt_at` shows when it will be picked up again:
+
+```sql
+select id, url, attempts, max_retries, next_attempt_at from net.http_request_queue;
+```
+
+### What gets retried
+
+Only failures that can plausibly succeed on another attempt:
+
+- Connection failures, DNS resolution failures, timeouts and other transport errors. Errors that won't change on a retry, like an unsupported URL scheme or a failed certificate verification, are not retried.
+- The `408`, `425`, `429` status codes and any `5xx` status code. Every other status code, `404` included, is considered the final answer.
+
+### Making a retry safe to repeat
+
+A request that times out or fails mid-flight may well have reached the server, so retrying a `POST` or a `DELETE` can duplicate its effect. Pass an `idempotency_key` for the server to recognize the retry as the same request:
+
+```sql
+select net.http_post(
+    url := 'https://api.example.com/charges',
+    body := '{"amount": 100}'::jsonb,
+    max_retries := 3,
+    idempotency_key := gen_random_uuid()::text
+) as request_id;
+```
+
+The key is sent as an `Idempotency-Key` header and every attempt of that request carries the same value. It replaces any header of that name already on `headers`. If the API expects the key under a different name, put it on `headers` directly, headers are also kept as they are across retries.
+
+### Delay between attempts
+
+The delay starts at `pg_net.retry_base_delay_milliseconds` and doubles on every attempt, up to `pg_net.retry_max_delay_milliseconds`. With the defaults, retries happen 1s, 2s, 4s, 8s ... up to 60s after the previous attempt.
+
+A `Retry-After` response header, in either its delay-seconds or its HTTP-date form, takes precedence over this backoff. It's also capped by `pg_net.retry_max_delay_milliseconds`.
+
+Note that `timeout_milliseconds` applies to each attempt, not to the request as a whole.
 
 ---
 
@@ -442,6 +531,8 @@ SELECT cron.schedule(
 ```
 
 ## Retrying failed requests
+
+pg_net retries a failed request on its own when the request is made with `max_retries`, see [Retries](#retries). What follows is how to retry requests that already exhausted their retries, or that were made without them.
 
 Every request made is logged within the net._http_response table. To identify failed requests, you can execute a query on the table, filtering for requests where the status code is 500 or higher.
 

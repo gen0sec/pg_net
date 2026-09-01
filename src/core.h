@@ -26,7 +26,16 @@ typedef struct {
   int32         timeout_milliseconds;
   NullableDatum headersBin;
   NullableDatum bodyBin;
+  int32         attempts;
+  int32         max_retries;
+  NullableDatum headersJson; // the raw jsonb headers, only needed to requeue a retried request
 } RequestQueueRow;
+
+// How long to wait before retrying a failed request
+typedef struct {
+  int base_delay_milliseconds;
+  int max_delay_milliseconds;
+} RetryPolicy;
 
 // The curl easy handle plus additional data, this acts for both the request and
 // response cycle
@@ -39,6 +48,12 @@ typedef struct {
   char              *req_body;
   char              *method;
   CURL              *ez_handle;
+  // attempts made for this request, including the one this handle is doing
+  int32 attempts;
+  int32 max_retries;
+  // copies of the queue row columns, only kept when the request can be retried
+  NullableDatum headersJson;
+  NullableDatum bodyBin;
 } CurlHandle;
 
 uint64 delete_expired_responses(char *ttl, int batch_size);
@@ -49,7 +64,10 @@ RequestQueueRow get_request_queue_row(HeapTuple spi_tupval, TupleDesc spi_tupdes
 
 void set_curl_mhandle(WorkerState *wstate);
 
-void insert_response(CurlHandle *handle, CURLcode curl_return_code);
+// inserts the response, or requeues the request when the failure is retryable
+void complete_request(CurlHandle *handle, CURLcode curl_return_code, RetryPolicy policy);
+
+bool queue_has_scheduled_requests(void);
 
 void init_curl_handle(CurlHandle *handle, RequestQueueRow row);
 

@@ -43,6 +43,8 @@ static char *guc_ttl;
 static int   guc_batch_size;
 static char *guc_database_name;
 static char *guc_username;
+static int   guc_retry_base_delay_milliseconds;
+static int   guc_retry_max_delay_milliseconds;
 
 #if PG15_GTE
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
@@ -241,6 +243,12 @@ static bool is_extension_locked(Oid ext_table_oids[static total_extension_tables
   return is_locked;
 }
 
+// The worker queries columns added on 0.21.0, when they're missing the extension was not updated
+// after the library was upgraded. Processing requests would only produce errors in that state.
+static bool is_extension_outdated(Oid queue_oid) {
+  return get_attnum(queue_oid, "next_attempt_at") == InvalidAttrNumber;
+}
+
 static void unlock_extension(Oid ext_table_oids[static total_extension_tables]) {
   UnlockRelationOid(ext_table_oids[0], AccessShareLock);
   UnlockRelationOid(ext_table_oids[1], AccessShareLock);
@@ -260,8 +268,10 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
 
   elog(INFO,
        "pg_net worker started with a config of: pg_net.ttl=%s, pg_net.batch_size=%d, "
-       "pg_net.username=%s, pg_net.database_name=%s",
-       guc_ttl, guc_batch_size, guc_username, guc_database_name);
+       "pg_net.username=%s, pg_net.database_name=%s, "
+       "pg_net.retry_base_delay_milliseconds=%d, pg_net.retry_max_delay_milliseconds=%d",
+       guc_ttl, guc_batch_size, guc_username, guc_database_name, guc_retry_base_delay_milliseconds,
+       guc_retry_max_delay_milliseconds);
 
   int curl_ret = curl_global_init(CURL_GLOBAL_ALL);
   if (curl_ret != CURLE_OK)
@@ -294,8 +304,11 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
 
     pgstat_report_activity(STATE_RUNNING, NULL);
 
-    uint64 requests_consumed = 0;
-    uint64 expired_responses = 0;
+    uint64 requests_consumed  = 0;
+    uint64 expired_responses  = 0;
+    bool   scheduled_requests = false;
+    bool   extension_outdated = false;
+    bool   warned_on_outdated = false;
 
     do {
       SetCurrentStatementStartTimestamp();
@@ -309,6 +322,24 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
         PopActiveSnapshot();
         AbortCurrentTransaction();
         break;
+      }
+
+      extension_outdated = is_extension_outdated(ext_table_oids[0]);
+
+      if (extension_outdated) { // keep the requests queued until the extension is updated
+        if (!warned_on_outdated) {
+          ereport(WARNING, errmsg("the pg_net extension is older than its loaded library"),
+                  errdetail("requests are left on the queue until the extension is updated"),
+                  errhint("run \"alter extension pg_net update\" to update it to " EXTVERSION "."));
+          warned_on_outdated = true;
+        }
+
+        unlock_extension(ext_table_oids);
+        PopActiveSnapshot();
+        AbortCurrentTransaction();
+
+        wait_while_processing_interrupts(WORKER_WAIT_ONE_SECOND, &worker_should_restart);
+        continue;
       }
 
       SPI_connect();
@@ -373,7 +404,9 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
             if (msg->msg == CURLMSG_DONE) {
               CurlHandle *handle = NULL;
               EREPORT_CURL_GETINFO(msg->easy_handle, CURLINFO_PRIVATE, &handle);
-              insert_response(handle, msg->data.result);
+              complete_request(handle, msg->data.result,
+                               (RetryPolicy){guc_retry_base_delay_milliseconds,
+                                             guc_retry_max_delay_milliseconds});
             } else {
               ereport(ERROR, errmsg("curl_multi_info_read(), CURLMsg=%d\n", msg->msg));
             }
@@ -396,6 +429,10 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
         pfree(handles);
       }
 
+      // requests retried on this batch are scheduled for a later time, keep the worker going so
+      // they're picked up when they're due
+      scheduled_requests = queue_has_scheduled_requests();
+
       SPI_finish();
 
       unlock_extension(ext_table_oids);
@@ -415,7 +452,8 @@ void pg_net_worker(__attribute__((unused)) Datum main_arg) {
       // slow down queue processing to avoid using too much CPU
       wait_while_processing_interrupts(WORKER_WAIT_ONE_SECOND, &worker_should_restart);
 
-    } while (!worker_should_restart && (requests_consumed > 0 || expired_responses > 0));
+    } while (!worker_should_restart && (requests_consumed > 0 || expired_responses > 0 ||
+                                        scheduled_requests || extension_outdated));
 
     // Inner loop drained; back to waiting for the next wake.
     pgstat_report_activity(STATE_IDLE, NULL);
@@ -500,6 +538,17 @@ void _PG_init(void) {
   DefineCustomIntVariable(
       "pg_net.batch_size", "number of requests executed in one iteration of the background worker",
       NULL, &guc_batch_size, 200, 0, PG_INT16_MAX, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+  DefineCustomIntVariable(
+      "pg_net.retry_base_delay_milliseconds", "base delay before retrying a failed request",
+      "the delay doubles on every attempt, up to "
+      "pg_net.retry_max_delay_milliseconds",
+      &guc_retry_base_delay_milliseconds, 1000, 0, 3600000, PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+  DefineCustomIntVariable(
+      "pg_net.retry_max_delay_milliseconds", "maximum delay before retrying a failed request",
+      "also caps the delay asked for by a Retry-After response header",
+      &guc_retry_max_delay_milliseconds, 60000, 0, 86400000, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
   DefineCustomStringVariable("pg_net.database_name", "Database where the worker will connect to",
                              NULL, &guc_database_name, "postgres", PGC_SU_BACKEND, 0, NULL, NULL,
