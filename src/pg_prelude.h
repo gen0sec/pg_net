@@ -34,6 +34,7 @@
 #include <tsearch/ts_locale.h>
 #include <utils/acl.h>
 #include <utils/builtins.h>
+#include <utils/datum.h>
 #include <utils/fmgrprotos.h>
 #include <utils/guc.h>
 #include <utils/guc_tables.h>
