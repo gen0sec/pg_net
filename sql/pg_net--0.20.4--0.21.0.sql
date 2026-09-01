@@ -1,122 +1,17 @@
-create schema if not exists net;
+alter table net.http_request_queue
+  add column if not exists max_retries int not null default 0 check (max_retries >= 0),
+  add column if not exists attempts int not null default 0,
+  add column if not exists next_attempt_at timestamptz not null default now();
 
-create domain net.http_method as text
-check (
-  value ilike 'get'
-  or value ilike 'post'
-  or value ilike 'delete'
-);
+alter table net._http_response
+  add column if not exists attempts int not null default 1;
 
--- Store pending requests. The background worker reads from here
--- API: Private
-create unlogged table net.http_request_queue(
-    id bigserial,
-    method net.http_method not null,
-    url text not null,
-    headers jsonb,
-    body bytea,
-    timeout_milliseconds int not null,
-    -- how many times the worker will retry this request after a failed attempt
-    max_retries int not null default 0 check (max_retries >= 0),
-    -- attempts already made for this request, only greater than zero on a retried request
-    attempts int not null default 0,
-    -- the earliest time the worker is allowed to pick this request up
-    next_attempt_at timestamptz not null default now()
-);
+-- the request functions gain `max_retries` and `idempotency_key` arguments, drop the previous
+-- signatures so the new ones don't end up as ambiguous overloads
+drop function if exists net.http_get(text, jsonb, jsonb, integer);
+drop function if exists net.http_post(text, jsonb, jsonb, jsonb, integer);
+drop function if exists net.http_delete(text, jsonb, jsonb, integer, jsonb);
 
-create or replace function net.check_worker_is_up() returns void as $$
-begin
-  if not exists (select pid from pg_stat_activity where backend_type ilike '%pg_net%') then
-    raise exception using
-      message = 'the pg_net background worker is not up'
-    , detail  = 'the pg_net background worker is down due to an internal error and cannot process requests'
-    , hint    = 'make sure that you didn''t modify any of pg_net internal tables';
-  end if;
-end
-$$ language plpgsql;
-comment on function net.check_worker_is_up() is 'raises an exception if the pg_net background worker is not up, otherwise it doesn''t return anything';
-
--- Associates a response with a request
--- API: Private
-create unlogged table net._http_response(
-    id bigint,
-    status_code integer,
-    content_type text,
-    headers jsonb,
-    content text,
-    timed_out bool,
-    error_msg text,
-    created timestamptz not null default now(),
-    -- total number of attempts made for the request, greater than one when it was retried
-    attempts int not null default 1
-);
-
-create index on net._http_response (created);
-
--- Blocks until an http_request is complete
--- API: Private
-create or replace function net._await_response(
-    request_id bigint
-)
-    returns bool
-    language plpgsql
-as $$
-declare
-    rec net._http_response;
-begin
-    while rec is null loop
-        select *
-        into rec
-        from net._http_response
-        where id = request_id;
-
-        if rec is null then
-            -- Wait 50 ms before checking again
-            perform pg_sleep(0.05);
-        end if;
-    end loop;
-
-    return true;
-end;
-$$;
-
-
--- url encode a string
--- API: Private
-create or replace function net._urlencode_string(string varchar)
-    -- url encoded string
-    returns text
-    language 'c'
-    immutable
-as 'MODULE_PATHNAME';
-
--- API: Private
-create or replace function net._encode_url_with_params_array(url text, params_array text[])
-    -- url encoded string
-    returns text
-    language 'c'
-    immutable
-as 'MODULE_PATHNAME';
-
-create or replace function net.worker_restart()
-  returns bool
-  language 'c'
-as 'MODULE_PATHNAME';
-
-create or replace function net.wait_until_running()
-  returns void
-  language 'c'
-as 'MODULE_PATHNAME';
-comment on function net.wait_until_running() is 'waits until the worker is running';
-
-create or replace function net.wake()
-  returns void
-  language 'c'
-as 'MODULE_PATHNAME';
-
--- Puts an `Idempotency-Key` header on the given headers, replacing any header that already goes
--- by that name, whatever its case
--- API: Private
 create or replace function net._with_idempotency_key(headers jsonb, idempotency_key text)
     returns jsonb
     language sql
@@ -132,8 +27,6 @@ as $$
     ) || jsonb_build_object('Idempotency-Key', idempotency_key);
 $$;
 
--- Interface to make an async request
--- API: Public
 create or replace function net.http_get(
     -- url for the request
     url text,
@@ -182,8 +75,6 @@ begin
 end
 $$;
 
--- Interface to make an async request
--- API: Public
 create or replace function net.http_post(
     -- url for the request
     url text,
@@ -266,8 +157,6 @@ begin
 end
 $$;
 
--- Interface to make an async request
--- API: Public
 create or replace function net.http_delete(
     -- url for the request
     url text,
@@ -318,98 +207,3 @@ begin
     return request_id;
 end
 $$;
-
--- Lifecycle states of a request (all protocols)
--- API: Public
-create type net.request_status as enum ('PENDING', 'SUCCESS', 'ERROR');
-
-
--- A response from an HTTP server
--- API: Public
-create type net.http_response AS (
-    status_code integer,
-    headers jsonb,
-    body text
-);
-
--- State wrapper around responses
--- API: Public
-create type net.http_response_result as (
-    status net.request_status,
-    message text,
-    response net.http_response
-);
-
-
--- Collect respones of an http request
--- API: Private
-create or replace function net._http_collect_response(
-    -- request_id reference
-    request_id bigint,
-    -- when `true`, return immediately. when `false` wait for the request to complete before returning
-    async bool default true
-)
-    -- http response composite wrapped in a result type
-    returns net.http_response_result
-    language plpgsql
-as $$
-declare
-    rec net._http_response;
-    req_exists boolean;
-begin
-
-    if not async then
-        perform net._await_response(request_id);
-    end if;
-
-    select *
-    into rec
-    from net._http_response
-    where id = request_id;
-
-    if rec is null or rec.error_msg is not null then
-        -- The request is either still processing or the request_id provided does not exist
-
-        -- TODO: request in progress is indistinguishable from request that doesn't exist
-
-        -- No request matching request_id found
-        return (
-            'ERROR',
-            coalesce(rec.error_msg, 'request matching request_id not found'),
-            null
-        )::net.http_response_result;
-
-    end if;
-
-    -- Return a valid, populated http_response_result
-    return (
-        'SUCCESS',
-        'ok',
-        (
-            rec.status_code,
-            rec.headers,
-            rec.content
-        )::net.http_response
-    )::net.http_response_result;
-end;
-$$;
-
-create or replace function net.http_collect_response(
-    -- request_id reference
-    request_id bigint,
-    -- when `true`, return immediately. when `false` wait for the request to complete before returning
-    async bool default true
-)
-    -- http response composite wrapped in a result type
-    returns net.http_response_result
-    language plpgsql
-as $$
-begin
-  raise notice 'The net.http_collect_response function is deprecated.';
-  select net._http_collect_response(request_id, async);
-end;
-$$;
-
-grant usage on schema net to PUBLIC;
-grant all on all sequences in schema net to PUBLIC;
-grant all on all tables in schema net to PUBLIC;
